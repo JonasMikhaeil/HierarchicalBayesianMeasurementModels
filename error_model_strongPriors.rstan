@@ -1,0 +1,40 @@
+
+data {
+  int<lower=0> N;   
+  vector[N] A0;
+  vector[N] A1;      
+  vector[N] Z;
+  real<lower=0> sd_B;  
+  real gamma;
+  real beta;
+  real<lower=0> sd_gamma;  
+}
+
+parameters {
+  real<lower=-1,upper=1> eta;      
+  real alpha;
+  vector[N] B0;
+  vector[N] B1;  
+  real gamma_rand;
+  real beta_rand;
+  real<lower=0> sd_A;
+}
+
+transformed parameters{
+real<lower=0> sd_B1 = sd_B^2*sqrt(1-eta^2);
+}
+model {
+  B0 ~ normal(beta_rand*Z,sd_B);
+  B1 ~normal(beta_rand*(Z-eta*Z)+eta*B0,sd_B1);
+  A0 ~ normal(alpha *Z +gamma_rand*B0,sd_A);
+  A1 ~ normal(alpha*Z+gamma_rand*B1,sd_A);
+  eta ~normal(0,.2);
+  alpha ~ normal(0,1);
+  sd_A ~ normal(0,1);
+  gamma_rand ~ normal(gamma,sd_gamma);
+  beta_rand ~ normal(beta,0.1);
+}
+generated quantities {
+  real delta = eta *sd_B^2;
+  vector[N] B1_pred = B1;
+}

@@ -1,0 +1,172 @@
+
+```{r}
+library(ggplot2)
+```
+
+
+```{r}
+set.seed(123)
+n <- 40
+epsilon <- rnorm(n, 0, 0.2)
+X <- runif(n, -1, 1)
+beta <- 2
+U <- beta * X + epsilon
+Y <- beta * X + epsilon +  rnorm(n, 0, 0.2)
+data_reg <- data.frame(Y = Y, U = U, X = X)
+mod_true <- lm(U ~ X, data = data_reg)
+mod_proxy <- lm(Y ~ X, data = data_reg)
+
+Y2 <- beta * X + (epsilon + rnorm(n, 0, 0.2) + 0.8 * X)
+mod_proxy2 <- lm(Y2 ~ X, data = data_reg)
+data <-
+  data.frame(X = c(X, X),
+             Y = c(U, Y),
+             label = as.factor(c(rep("t", n), rep("p", n))))
+data2 <-
+  data.frame(X = c(X, X),
+             Y = c(U, Y2),
+             label = as.factor(c(rep("t", n), rep("p", n))))
+data3 <-
+  data.frame(
+    X = c(X, X),
+    Y = c(U - predict(mod_true, data_reg), U - predict(mod_proxy, data_reg)),
+    label = as.factor(c(rep("t", n), rep("p", n)))
+  )
+data4 <-
+  data.frame(
+    X = c(X, X),
+    Y = c(
+      U - predict(mod_true, data_reg),
+      U - predict(mod_proxy2, data_reg)
+    ),
+    label = as.factor(c(rep("t", n), rep("p", n)))
+  )
+
+```
+
+
+
+
+
+```{r}
+plot1 <- ggplot() +
+  geom_point(data = data, aes(x = X, y = Y, col = label)) +
+  scale_colour_manual(values = c("steelblue", "black")) +
+  geom_abline(
+    intercept = mod_proxy$coefficients[1],
+    slope = mod_proxy$coefficients[2],
+    color = "steelblue"
+  ) +
+  geom_abline(
+    intercept = mod_true$coefficients[1],
+    slope = mod_true$coefficients[2],
+    color = "black"
+  ) +
+  scale_y_continuous(breaks = c(-2, 0, 2)) +
+  theme_minimal() +
+  theme(
+    legend.title = element_blank(),
+    legend.position = "none",
+    axis.title.x = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.line = element_line(colour = "black")
+  ) +
+  ylab("Outcome")
+
+library(patchwork)
+plot2 <- ggplot() +
+  geom_point(data = data2, aes(x = X, y = Y, col = label)) +
+  scale_colour_manual(values = c("steelblue", "black")) +
+  geom_abline(
+    intercept = mod_proxy2$coefficients[1],
+    slope = mod_proxy2$coefficients[2],
+    color = "steelblue"
+  ) +
+  geom_abline(
+    intercept = mod_true$coefficients[1],
+    slope = mod_true$coefficients[2],
+    color = "black"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.title = element_blank(),
+    legend.position = "none",
+    axis.title.y = element_blank(),
+    axis.title.x = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.text.y = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.line = element_line(colour = "black")
+  ) +
+  annotate(
+    geom = "text",
+    x = -0.2,
+    y = -2.3,
+    label = "proxy outcome",
+    col = "steelblue"
+  ) +
+  annotate(
+    geom = "text",
+    x = 0.7,
+    y = 0.3,
+    label = "true outcome",
+    col = "black"
+  )
+
+plot3 <- ggplot() +
+  geom_abline(intercept = 0,
+              slope = 0,
+              color = "grey") +
+  geom_point(data = data3, aes(x = X, y = Y, col = label)) +
+  scale_colour_manual(values = c("steelblue", "black")) +
+  scale_y_continuous(breaks = c(-.5, 0, .5), limits = c(-0.8, 0.8)) +
+  theme_minimal() +
+  theme(
+    legend.title = element_blank(),
+    legend.position = "none",
+    axis.title.x = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.line = element_line(colour = "black")
+  ) +
+  ylab("Residual with \n true outcome")
+
+plot4 <- ggplot() +
+  geom_abline(intercept = 0,
+              slope = 0,
+              color = "grey") +
+  geom_point(data = data4, aes(x = X, y = Y, col = label)) +
+  scale_colour_manual(values = c("steelblue", "black")) +
+  scale_y_continuous(breaks = c(-.5, 0, .5), limits = c(-0.8, 0.8)) +
+  theme_minimal() +
+  theme(
+    legend.title = element_blank(),
+    legend.position = "none",
+    axis.title.y = element_blank(),
+    axis.title.x = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.text.y = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.line = element_line(colour = "black")
+  )
+
+
+#pdf("simple_reg_illustration.pdf",7,5)
+hpatch <-
+  (plot1 + plot2) / (plot3 + plot4) &
+  xlab(NULL) & theme(plot.margin = margin(5.5, 5.5, 5.5, 5.5))
+
+wrap_elements(hpatch) +
+  labs(tag = "Covariate X") +
+  theme(plot.tag = element_text(size = rel(1), angle = 0),
+        plot.tag.position = "bottom") 
+```
+
+

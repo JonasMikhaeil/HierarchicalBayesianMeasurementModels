@@ -1,0 +1,723 @@
+---
+title: "Diabetes_Example"
+author: "Jonas Mikhaeil"
+date: "2024-01-29"
+output: html_document
+---
+```{r,message=False}
+library(tidyverse)
+library(readr)
+library(janitor)
+library("rstan")
+library(patchwork)
+library(grid)
+library("caret")
+library(patchwork)
+
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+```
+
+
+## Read in data
+
+NHANES data provided by  https://github.com/madisoncoots/race-in-diabetes-screening/tree/main (Coots, 2023).
+We normalize the weights to have mean 1.
+
+```{r}
+data <- readRDS(file = "data/diabetes/processed/data.rds")
+data$wtmec8yr <- data$wtmec8yr / mean(data$wtmec8yr)
+
+formula1 <-
+  diabetes_diagnosis ~ health_insurance + gender + ridageyr + bmxbmi + (ridageyr *
+                                                                          bmxbmi) +
+  whd140 + bmxwt + bmxht + bmxwaist + relatives_had_diabetes + felt_depressed +
+  income + as.factor(ntile(data$bmxbmi, 10)) + food_security
+
+formula2 <-
+  ~ diabetes + diabetes_diagnosis + wtmec8yr + gender + ridageyr + bmxbmi + (ridageyr *
+                                                                               bmxbmi) +
+  whd140 + bmxwt + bmxht + bmxwaist + relatives_had_diabetes + felt_depressed +
+  income + health_insurance  + food_security
+### create data-set by selecting all relevant variables and cleaned of NaNs
+data_clean <- data %>%
+  dplyr::select(all.vars(formula2)) %>%
+  na.omit()
+###create model matrix for stan
+data <- data_clean
+X <- model.matrix(formula1 , data = data)
+```
+
+### Fit classical logistic regression models
+Fit simple, complex and ground-truth model
+
+```{r}
+simple_formula <-
+  diabetes_diagnosis ~ gender + ridageyr + bmxbmi + (ridageyr * bmxbmi) + as.factor(ntile(data$bmxbmi, 10)) +
+  whd140 + bmxwt + bmxht + bmxwaist + relatives_had_diabetes + felt_depressed +
+  income + food_security
+simple_model <- glm(
+  simple_formula,
+  data = data,
+  family = quasibinomial("logit"),
+  weights = wtmec8yr
+)
+simple_model_pred <-
+  predict(simple_model, newdata = data, type = "response")
+
+complex_formula <-
+  diabetes_diagnosis ~ health_insurance + gender + ridageyr + bmxbmi + (ridageyr *
+                                                                          bmxbmi) + as.factor(ntile(data$bmxbmi, 10)) +
+  whd140 + bmxwt + bmxht + bmxwaist + relatives_had_diabetes + felt_depressed +
+  income + food_security
+complex_model <- glm(
+  complex_formula,
+  data = data,
+  family = quasibinomial("logit"),
+  weights = wtmec8yr
+)
+complex_model_pred <-
+  predict(complex_model, newdata = data, type = "response")
+
+#Full model to approximate ground-truth diabetes incidence rates
+oracle_model_formula <-
+  diabetes ~ gender + ridageyr + bmxbmi + (ridageyr * bmxbmi) + as.factor(ntile(data$bmxbmi, 10)) +
+  whd140 + bmxwt + bmxht + bmxwaist + relatives_had_diabetes + felt_depressed +
+  income + health_insurance  + food_security
+
+oracle_model <- glm(
+  oracle_model_formula,
+  data = data,
+  family = quasibinomial("logit"),
+  weights = wtmec8yr
+)
+
+oracle_model_pred <-
+  predict(oracle_model, newdata = data, type = "response")
+```
+
+
+
+## Measurement Model
+
+### Determining thresholds from prior knowledge
+We know the total rate of diabetes in the population is around $14\%$, choose mean accordingly.
+
+Base-rate should be roughly 14%.
+```{r}
+alpha <- -1.8
+x <- rlogis(100000, alpha, 1)
+mean(x > 0)
+```
+
+Determine thresholds based on base-rate:
+Uninsured: roughly 29% undiagnosed
+```{r}
+beta1 <- -0.38
+y <- rlogis(100000, alpha + beta1, 1)
+1 - mean(y > 0) / mean(x > 0)
+```
+Insured: roughly 16% undiagnosed
+```{r}
+beta2 <- -0.22
+y <- rlogis(100000, alpha + beta2, 1)
+1 - mean(y > 0) / mean(x > 0)
+```
+
+### Fit MLE version of measurement model 
+
+Maximum-likelihood version of measurement model (does not incorporate term $e$ for idiosyncrasies).
+```{r}
+errorModel_formula <-
+  diabetes_diagnosis ~ gender + ridageyr + bmxbmi + (ridageyr * bmxbmi) + as.factor(ntile(data$bmxbmi, 10)) +
+  whd140 + bmxwt + bmxht + bmxwaist + relatives_had_diabetes + felt_depressed +
+  income + health_insurance  + food_security
+errorModel <- glm(
+  errorModel_formula,
+  data = data,
+  family = quasibinomial("logit"),
+  weights = wtmec8yr
+)
+
+EM_predict <- function(model, data, shift) {
+  alpha <- errorModel$coefficients["(Intercept)"]
+  beta <- errorModel$coefficients["health_insuranceYes"]
+  alpha <- alpha + shift[1]
+  beta <- beta + shift[2]
+  errorModel$coefficients["(Intercept)"] <- alpha
+  errorModel$coefficients["health_insuranceYes"] <- beta
+  predict(errorModel, newdata = data, type = "response")
+}
+
+errorModel_pred <- EM_predict(errorModel, data, c(0.38, -0.17))  
+```
+
+### Threshold model with Stan
+
+Here we run the following Hierarchical Bayesian measurement model, where the thresholds are as determined above.
+$$
+\begin{align} \nonumber
+y \, &= \, \begin{cases}
+    1 \, \, \text{if}\, \, u_2 \geq 0 \\
+    0 \, \, \text{else}
+\end{cases} \\[2pt] \nonumber
+    u_1 | \beta \, &\sim \, \text{logistic}(X\beta,1) \\[2pt] 
+    u_2 \, &= \,  u_1 - t(X) - e \\[2pt] \nonumber
+    u_3 \, &= \, \begin{cases}
+    1 \, \, \text{if}\, \, u_1 \geq 0 
+    \\[2pt] \nonumber
+    0 \, \, \text{else}
+\end{cases} \\[2pt] \nonumber
+e \, &\sim \, \text{normal}^+(0,0.1).
+\end{align}
+$$
+The model is implemented in logistic_regression_diabetes.rstan.
+Running the model takes some time to run. Predictions from an inferred model are saved as "diabetes_thresholdModel_pred" to ease reproduction of our plots.
+```{r}
+data_stan <- list(
+  N = dim(X)[1],
+  K = dim(X)[2],
+  diagnosis = data$diabetes_diagnosis,
+  weights = data$wtmec8yr,
+  x = X,
+  shift1 = 0.38,
+  shift2 = -0.17
+)
+init_fun_log <- function() {
+  list(beta = rnorm(dim(X)[2], 0, .1))
+}
+fit_bayes_stan <-
+  stan(
+    file = "logistic_regression_diabetes.rstan",
+    data = data_stan,
+    iter = 2000,
+    chains = 4,
+    init = init_fun_log,
+    refresh = 1000
+  )
+#saveRDS(fit_bayes_stan,file="measurementModel_fullX")
+```
+
+```{r}
+#fit_bayes_stan<-readRDS("measurementModel_fullX")
+#measurement_model_pred <- summary(fit_bayes_stan,pars="pred")$summary[ , "50%"]
+#saveRDS(measurement_model_pred,"diabetes_thresholdModel_pred")
+measurement_model_pred <- readRDS("diabetes_thresholdModel_pred")
+```
+
+
+## Plotting
+
+### Calibration plot: Comparison with empirical rate determined with logistic regression on true labels
+
+```{r}
+risk_score_upper_bound <- 0.3
+incidence_upper_bound <- 0.3
+scale_factor <- 1 / 0.01
+
+simple_calibration_plot_data <- data %>%
+  mutate(risk_score = simple_model_pred,
+         est_diabetes_prob = oracle_model_pred) %>%
+  filter(!is.na(risk_score), !is.na(est_diabetes_prob)) %>%
+  dplyr::select(health_insurance,
+                risk_score,
+                est_diabetes_prob,
+                wtmec8yr,
+                diabetes) %>%
+  mutate(risk_score_bin = round((risk_score) * scale_factor) / scale_factor) %>% # round to scale factor
+  group_by(health_insurance, risk_score_bin) %>%
+  summarize(
+    n_in_bin = sum(wtmec8yr),
+    bin_avg_risk_score = sum(risk_score * wtmec8yr) / sum(wtmec8yr),
+    diabetes_prev = sum(est_diabetes_prob * wtmec8yr) / sum(wtmec8yr),
+    ,
+    diabetes_prev_emp = sum(diabetes * wtmec8yr) / sum(wtmec8yr)
+  )
+
+
+complex_calibration_plot_data <- data %>%
+  mutate(risk_score = complex_model_pred,
+         est_diabetes_prob = oracle_model_pred) %>%
+  filter(!is.na(risk_score), !is.na(est_diabetes_prob)) %>%
+  dplyr::select(health_insurance,
+                risk_score,
+                est_diabetes_prob,
+                wtmec8yr,
+                diabetes) %>%
+  mutate(risk_score_bin = round((risk_score) * scale_factor) / scale_factor) %>%
+  group_by(health_insurance, risk_score_bin) %>%
+  summarize(
+    n_in_bin = sum(wtmec8yr),
+    bin_avg_risk_score = sum(risk_score * wtmec8yr) / sum(wtmec8yr),
+    diabetes_prev = sum(est_diabetes_prob * wtmec8yr) / sum(wtmec8yr),
+    diabetes_prev_emp = sum(diabetes * wtmec8yr) / sum(wtmec8yr)
+  )
+
+
+
+plot1 <- simple_calibration_plot_data %>%
+  ggplot(aes(
+    x = bin_avg_risk_score,
+    y = diabetes_prev,
+    color = as.factor(health_insurance)
+  )) +
+  scale_color_manual(values = c("#F88379", "#A52A2A")) +
+  geom_line() +
+  geom_point() +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed",
+    color = "darkgray"
+  ) +
+  xlab("Predicted risk") +
+  ylab("Observed diabetes rate") +
+  scale_y_continuous(
+    labels = scales::percent,
+    expand = c(0, 0),
+    breaks = seq(0.0, incidence_upper_bound, 0.05)
+  ) +
+  scale_x_continuous(
+    labels = scales::percent,
+    expand = c(0, 0.01),
+    breaks = seq(0.0, risk_score_upper_bound, 0.05)
+  ) +
+  coord_cartesian(
+    xlim = c(0, risk_score_upper_bound),
+    ylim = c(0, incidence_upper_bound)
+  ) +
+  theme_minimal() +
+  theme(
+    legend.title = element_blank(),
+    legend.position = "none",
+    axis.title.x = element_blank()
+  )
+
+
+plot2 <- complex_calibration_plot_data %>%
+  ggplot(aes(
+    x = bin_avg_risk_score,
+    y = diabetes_prev,
+    color = as.factor(health_insurance)
+  )) +
+  scale_color_manual(values = c("#7393B3", "#0F52BA")) +
+  geom_line() +
+  geom_point() +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed",
+    color = "darkgray"
+  ) +
+  xlab("Predicted risk") +
+  ylab("Observed diabetes rate") +
+  annotate(
+    geom = "text",
+    x = 0.15,
+    y = 0.03,
+    label = "health insurance",
+    col = "#0F52BA",
+    size = 3.5
+  ) +
+  annotate(
+    geom = "text",
+    x = 0.1,
+    y = 0.29,
+    label = "no health insurance",
+    col = "#7393B3",
+    size = 3.5
+  ) +
+  
+  scale_y_continuous(
+    labels = scales::percent,
+    expand = c(0, 0),
+    breaks = seq(0.0, incidence_upper_bound, 0.05)
+  ) +
+  scale_x_continuous(
+    labels = scales::percent,
+    expand = c(0, 0.01),
+    breaks = seq(0.0, risk_score_upper_bound, 0.05)
+  ) +
+  coord_cartesian(
+    xlim = c(0, risk_score_upper_bound),
+    ylim = c(0, incidence_upper_bound)
+  ) +
+  theme_minimal() +
+  theme(
+    legend.title = element_blank(),
+    legend.position = "none",
+    axis.title.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.text.y = element_blank(),
+  )
+```
+
+
+
+
+
+
+
+```{r}
+EM_calibration_plot_data <- data %>%
+  mutate(risk_score = measurement_model_pred,
+         est_diabetes_prob = oracle_model_pred) %>%
+  filter(!is.na(risk_score),!is.na(est_diabetes_prob)) %>%
+  dplyr::select(health_insurance,
+                risk_score,
+                est_diabetes_prob,
+                wtmec8yr,
+                diabetes) %>%
+  mutate(risk_score_bin = round((risk_score) * scale_factor) / scale_factor) %>% # round to the nearest 0.005
+  group_by(health_insurance, risk_score_bin) %>%
+  summarize(
+    n_in_bin = sum(wtmec8yr),
+    bin_avg_risk_score = sum(risk_score * wtmec8yr) / sum(wtmec8yr),
+    diabetes_prev = sum(est_diabetes_prob * wtmec8yr) / sum(wtmec8yr),
+    diabetes_prev_emp = sum(diabetes * wtmec8yr) / sum(wtmec8yr)
+  )
+
+plot3 <- EM_calibration_plot_data %>%
+  ggplot(aes(
+    x = bin_avg_risk_score,
+    y = diabetes_prev,
+    color = as.factor(health_insurance)
+  )) +
+  scale_color_manual(values = c("#ffc87c", "#ff8c00")) +
+  geom_line() +
+  geom_point() +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed",
+    color = "darkgray"
+  ) +
+  xlab("Predicted risk") +
+  ylab("Observed diabetes rate") +
+  scale_y_continuous(
+    labels = scales::percent,
+    expand = c(0, 0),
+    breaks = seq(0.0, incidence_upper_bound, 0.05)
+  ) +
+  scale_x_continuous(
+    labels = scales::percent,
+    expand = c(0, 0),
+    breaks = seq(0.0, risk_score_upper_bound, 0.05)
+  ) +
+  coord_cartesian(
+    xlim = c(0, risk_score_upper_bound),
+    ylim = c(0, incidence_upper_bound)
+  ) +
+  theme_minimal() +
+  theme(
+    legend.title = element_blank(),
+    legend.position = "none",
+    axis.title.y = element_blank(),
+    axis.title.x = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.text.y = element_blank()
+  )
+
+```
+
+
+
+
+```{r}
+#pdf("diabetes_riskPred.pdf",9,3)
+layout <- plot1 + plot2 + plot3
+wrap_elements(layout) +
+  theme(plot.margin = margin(
+    t = 0,
+    r = 0,
+    b = 0,
+    l = 0,
+    unit = "pt"
+  )) 
+```
+### Calibration plot: Comparison with empirical rate determined by naive binning - very noisy.
+
+
+```{r}
+risk_score_upper_bound <- 0.2
+incidence_upper_bound <- 0.2
+scale_factor <- 1 / 0.05
+simple_calibration_plot_data <- data %>%
+  mutate(risk_score = simple_model_pred,
+         est_diabetes_prob = oracle_model_pred) %>%
+  filter(!is.na(risk_score),!is.na(est_diabetes_prob)) %>%
+  dplyr::select(health_insurance,
+                risk_score,
+                est_diabetes_prob,
+                wtmec8yr,
+                diabetes) %>%
+  mutate(risk_score_bin = round((risk_score) * scale_factor) / scale_factor) %>% # round to the nearest 0.005
+  group_by(health_insurance, risk_score_bin) %>%
+  summarize(
+    n_in_bin = sum(wtmec8yr),
+    bin_avg_risk_score = sum(risk_score * wtmec8yr) / sum(wtmec8yr),
+    diabetes_prev = sum(est_diabetes_prob * wtmec8yr) / sum(wtmec8yr),
+    ,
+    diabetes_prev_emp = sum(diabetes * wtmec8yr) / sum(wtmec8yr)
+  )
+
+
+complex_calibration_plot_data <- data %>%
+  mutate(risk_score = complex_model_pred,
+         est_diabetes_prob = oracle_model_pred) %>%
+  filter(!is.na(risk_score),!is.na(est_diabetes_prob)) %>%
+  dplyr::select(health_insurance,
+                risk_score,
+                est_diabetes_prob,
+                wtmec8yr,
+                diabetes) %>%
+  mutate(risk_score_bin = round((risk_score) * scale_factor) / scale_factor) %>% # round to the nearest 0.005
+  group_by(health_insurance, risk_score_bin) %>%
+  summarize(
+    n_in_bin = sum(wtmec8yr),
+    bin_avg_risk_score = sum(risk_score * wtmec8yr) / sum(wtmec8yr),
+    diabetes_prev = sum(est_diabetes_prob * wtmec8yr) / sum(wtmec8yr),
+    diabetes_prev_emp = sum(diabetes * wtmec8yr) / sum(wtmec8yr)
+  )
+
+
+
+plot1_emp <- simple_calibration_plot_data %>%
+  ggplot(aes(
+    x = bin_avg_risk_score,
+    y = diabetes_prev_emp,
+    color = as.factor(health_insurance)
+  )) +
+  scale_color_manual(values = c("#F88379", "#A52A2A")) + #D22B2B
+  geom_line() +
+  geom_point() +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed",
+    color = "darkgray"
+  ) +
+  xlab("Predicted risk") +
+  ylab("Observed diabetes rate") +
+  scale_y_continuous(
+    labels = scales::percent,
+    expand = c(0, 0),
+    breaks = seq(0.0, incidence_upper_bound, 0.05)
+  ) +
+  scale_x_continuous(
+    labels = scales::percent,
+    expand = c(0, 0.01),
+    breaks = seq(0.0, risk_score_upper_bound, 0.05)
+  ) +
+  coord_cartesian(
+    xlim = c(0, risk_score_upper_bound),
+    ylim = c(0, incidence_upper_bound)
+  ) +
+  theme_minimal() +
+  theme(
+    legend.title = element_blank(),
+    legend.position = "none",
+    axis.title.x = element_blank()
+  )
+
+
+plot2_emp <- complex_calibration_plot_data %>%
+  ggplot(aes(
+    x = bin_avg_risk_score,
+    y = diabetes_prev_emp,
+    color = as.factor(health_insurance)
+  )) +
+  scale_color_manual(values = c("#7393B3", "#0F52BA")) +
+  geom_line() +
+  geom_point() +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed",
+    color = "darkgray"
+  ) +
+  xlab("Predicted risk") +
+  ylab("Observed diabetes rate") +
+  annotate(
+    geom = "text",
+    x = 0.1,
+    y = 0.03,
+    label = "health insurance",
+    col = "#0F52BA",
+    size = 3.5
+  ) +
+  annotate(
+    geom = "text",
+    x = 0.06,
+    y = 0.19,
+    label = "no health insurance",
+    col = "#7393B3",
+    size = 3.5
+  ) +
+  
+  
+  scale_y_continuous(
+    labels = scales::percent,
+    expand = c(0, 0),
+    breaks = seq(0.0, incidence_upper_bound, 0.05)
+  ) +
+  scale_x_continuous(
+    labels = scales::percent,
+    expand = c(0, 0.01),
+    breaks = seq(0.0, risk_score_upper_bound, 0.05)
+  ) +
+  coord_cartesian(
+    xlim = c(0, risk_score_upper_bound),
+    ylim = c(0, incidence_upper_bound)
+  ) +
+  theme_minimal() +
+  theme(
+    legend.title = element_blank(),
+    legend.position = "none",
+    axis.title.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.text.y = element_blank()
+  )
+```
+
+
+```{r}
+EM_calibration_plot_data <- data_clean %>%
+  mutate(risk_score = measurement_model_pred,
+         est_diabetes_prob = oracle_model_pred) %>%
+  filter(!is.na(risk_score),!is.na(est_diabetes_prob)) %>%
+  dplyr::select(health_insurance,
+                risk_score,
+                est_diabetes_prob,
+                wtmec8yr,
+                diabetes) %>%
+  mutate(risk_score_bin = round((risk_score) * scale_factor) / scale_factor) %>% # round to the nearest 0.005
+  group_by(health_insurance, risk_score_bin) %>%
+  summarize(
+    n_in_bin = sum(wtmec8yr),
+    bin_avg_risk_score = sum(risk_score * wtmec8yr) / sum(wtmec8yr),
+    diabetes_prev = sum(est_diabetes_prob * wtmec8yr) / sum(wtmec8yr),
+    diabetes_prev_emp = sum(diabetes * wtmec8yr) / sum(wtmec8yr)
+  )
+plot3_emp <- EM_calibration_plot_data %>%
+  ggplot(aes(
+    x = bin_avg_risk_score,
+    y = diabetes_prev_emp,
+    color = as.factor(health_insurance)
+  )) +
+  scale_color_manual(values = c("#ffc87c", "#ff8c00")) +
+  geom_line() +
+  geom_point() +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed",
+    color = "darkgray"
+  ) +
+  xlab("Predicted risk") +
+  ylab("Observed diabetes rate") +
+  
+  scale_y_continuous(
+    labels = scales::percent,
+    expand = c(0, 0),
+    breaks = seq(0.0, incidence_upper_bound, 0.05)
+  ) +
+  scale_x_continuous(
+    labels = scales::percent,
+    expand = c(0, 0.01),
+    breaks = seq(0.0, risk_score_upper_bound, 0.05)
+  ) +
+  coord_cartesian(
+    xlim = c(0, risk_score_upper_bound),
+    ylim = c(0, incidence_upper_bound)
+  ) +
+  theme_minimal() +
+  theme(
+    legend.title = element_blank(),
+    legend.position = "none",
+    axis.title.y = element_blank(),
+    axis.title.x = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.text.y = element_blank()
+  )
+```
+
+
+```{r}
+pdf("diabetes_riskPred_emp.pdf",9,3)
+layout <- plot1_emp + plot2_emp + plot3_emp
+wrap_elements(layout) +
+  theme(plot.margin = margin(
+    t = 0,
+    r = 0,
+    b = 0,
+    l = 0,
+    unit = "pt"
+  )) 
+```
+
+## Measures of Accuracy
+
+```{r}
+log_score <- function(data, pred) {
+  mean(data * log(pred) + (1 - data) * log(1 - pred))
+}
+brier_score <- function(data, pred) {
+  mean(data * (2 * pred - (pred ^ 2 + (1 - pred) ^ 2) - 1) + (1 - data) *
+         (2 * (1 - pred) - (pred ^ 2 + (1 - pred) ^ 2) - 1))
+}
+
+MSE <- function(data, pred) {
+  mean((round(pred) - data)) ^ 2
+  
+}
+accuracy <-  function(data, pred) {
+  length(pred[(round(pred) - data) == 0]) / length(data)
+}
+
+log_score(data$diabetes, simple_model_pred)
+log_score(data$diabetes, complex_model_pred)
+log_score(data$diabetes, measurement_model_pred)
+log_score(data$diabetes, oracle_model_pred)
+brier_score(data$diabetes, simple_model_pred)
+brier_score(data$diabetes, complex_model_pred)
+brier_score(data$diabetes, measurement_model_pred)
+brier_score(data$diabetes, oracle_model_pred)
+MSE(data$diabetes, simple_model_pred)
+MSE(data$diabetes, complex_model_pred)
+MSE(data$diabetes, measurement_model_pred)
+MSE(data$diabetes, oracle_model_pred)
+
+accuracy(data$diabetes, simple_model_pred)
+accuracy(data$diabetes, complex_model_pred)
+accuracy(data$diabetes, measurement_model_pred)
+accuracy(data$diabetes, oracle_model_pred)
+confusionMatrix(
+  as.factor(round(simple_model_pred)),
+  as.factor(round(data$diabetes)),
+  positive = "1",
+  dnn = c("Prediction", "Reference"),
+)
+confusionMatrix(
+  as.factor(round(complex_model_pred)),
+  as.factor(round(data$diabetes)),
+  positive = "1",
+  dnn = c("Prediction", "Reference"),
+)
+confusionMatrix(
+  as.factor(round(measurement_model_pred)),
+  as.factor(round(data$diabetes)),
+  positive = "1",
+  dnn = c("Prediction", "Reference"),
+)
+confusionMatrix(
+  as.factor(round(oracle_model_pred)),
+  as.factor(round(data$diabetes)),
+  positive = "1",
+  dnn = c("Prediction", "Reference"),
+)
+```
+
+
+
+

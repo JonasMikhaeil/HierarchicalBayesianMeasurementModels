@@ -1,0 +1,30 @@
+
+data {
+  int<lower=0> N;  
+  int<lower=0> K;
+  int diagnosis[N];
+  vector[N] weights;
+
+  matrix[N,K] x;
+  real shift1;
+  real shift2;
+}
+parameters {
+vector[K] beta; 
+vector<lower=0>[N] e;
+}
+model {
+  e~normal(0,0.1);
+  for(n in 1:N){
+    //target += bernoulli_lpmf(diagnosis[n] | Phi_approx(x[n]*beta-e[n]))* weights[n];
+    //target += bernoulli_lpmf(diagnosis[n] | Phi_approx(x[n]*beta))* weights[n];
+  target += bernoulli_logit_lpmf(diagnosis[n] | x[n]*beta-e[n])* weights[n];
+  }
+}
+generated quantities {
+  vector[N] pred;  
+  vector[K] beta_pred = beta;
+  beta_pred[1] = beta_pred[1]+shift1 - 0.1*sqrt(2/pi()); 
+  beta_pred[2] = beta_pred[2]+shift2;
+  pred = inv_logit(x*beta_pred+e);
+}

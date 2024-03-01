@@ -1,0 +1,473 @@
+---
+title: "SylizedExample_CrimeArrests"
+author: "Jonas Mikhaeil"
+date: "2024-02-20"
+output: html_document
+---
+
+```{r}
+library("MASS")
+library("rstan")
+library("extraDistr")
+library(ggplot2)
+
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+```
+
+## Stylized Example: Linear SEM for Arrest and Behavior
+
+Zanger-Tishler et al. (2023) propose the following linear SEM as an
+stylized model for arrests and behavior
+
+$$
+\begin{align} \nonumber    Z &\sim Normal(0,\sigma_Z) \\  \begin{bmatrix}B_0  \\B_1   \end{bmatrix} | Z  &\sim MVN  \bigg(\begin{bmatrix}\beta  Z  \\\beta Z   \end{bmatrix},\begin{bmatrix}\sigma_B^2 & \delta \\\delta & \sigma_B^2 \end{bmatrix}\bigg) \\\nonumber A_0 |Z,B_0& \sim Normal(\alpha Z + \gamma B_0, \sigma_A) \\\nonumber A_1 |Z,B_1& \sim Normal(\alpha Z + \gamma B_1, \sigma_A).\end{align} 
+$$
+
+The following code simulates data from this model:
+
+```{r}
+create_SEM_data <- function(beta, n)
+{
+  ### set parameters for the SEM
+  alpha <- 0.4
+  gamma <- 0.4
+  delta <- 0.4
+  ### define standard deviations. Zanger-Tishler et al. (2023) show how to choose the standard deviations of the exogenous variables such that (B0,B1,A0,A1,Z) are standardized.
+  sd_z <- 1
+  sd_A <- sqrt(1 - alpha ^ 2 - gamma ^ 2 - 2 * alpha * beta * gamma)
+  sd_B <- sqrt(1 - beta ^ 2)
+  ### define exogenous variables
+  U_Z <- rnorm(n = n, mean = 0, sd = sd_z)
+  U_A0 <- rnorm(n = n, mean = 0, sd = sd_A)
+  U_A1 <- rnorm(n = n, mean = 0, sd = sd_A)
+  sigma <- matrix(c(sd_B ^ 2, delta, delta, sd_B ^ 2), 2)
+  U_B <- mvrnorm(n = n,
+                 mu = rep(0, 2),
+                 Sigma = sigma)
+  ### calculate states
+  Z <- U_Z
+  B_0 <- beta * Z + U_B[, 1]
+  B_1 <- beta * Z + U_B[, 2]
+  A_0 = alpha * Z + gamma * B_0 + U_A0
+  A_1 = alpha * Z + gamma * B_1 + U_A1
+  data.frame(
+    A0 = A_0,
+    A1 = A_1,
+    B0 = B_0,
+    B1 = B_1,
+    Z = Z,
+    alpha = alpha,
+    beta = beta,
+    gamma = gamma,
+    delta = delta,
+    sd_z = sd_z,
+    sd_A = sd_A,
+    sd_B = sd_B
+  )
+}
+```
+
+
+## Hierarchichal Bayesian Measurement Model: Leakage Model
+
+
+$$
+\begin{align} 
+    y_1 | u_1, \alpha,\gamma,\sigma_y \, &\sim \, \text{normal}(X \alpha + \gamma u_1, \sigma_y) 
+    \\
+     y_2 | u_2, \alpha,\gamma,\sigma_y \, &\sim \, \text{normal}(X \alpha + \gamma u_2, \sigma_y) 
+     \\
+      u_1 | \beta \sigma_u\, &\sim \, \text{normal}(X \beta , \sigma_u) 
+      \\
+      u_2 | u_1, \beta, \eta, \sigma_u\, &\sim \, \text{normal}(X \beta + \eta(u_1 - X\beta) , \sigma_u \sqrt{1-\eta^2})\\
+       \sigma_y &\sim \text{normal}^+(0,1) \\
+    \alpha &\sim \text{normal}(0,1) \\
+    \eta &\sim \text{normal}(0,0.2) \\
+    \beta &\sim \text{normal}(\beta_{true},0.1) \\
+    \gamma &\sim \text{normal}(\gamma_{true},0.1).
+\end{align}
+$$
+This measurement model is implemented in error_model_strongPriors.rstan. 
+The following R code fits the model.
+```{r}
+data_em_sp <- list(
+  N = n,
+  A0 = sem_data$A0,
+  A1 = sem_data$A1,
+  Z = sem_data$Z,
+  sd_B = sem_data$sd_B[1],
+  beta = sem_data$beta[1],
+  gamma = sem_data$gamma[1] + 0.1,
+  sd_gamma = 0.2
+)
+init_fun_em_sp <-
+  function() {
+    list(
+      B0 = rnorm(n, 0, 1),
+      B1 = rnorm(n, 0, 1),
+      sd_A = rhnorm(1, 1),
+      eta = runif(1, 0, 1),
+      alpha = rnorm(1, 0, 1),
+      gamma_rand = rbeta(1, 1, 1),
+      alpha_rand = rnorm(1, 0, 1)
+    )
+  }
+fit_em_sp <-
+  stan(
+    file = "error_model_strongPriors.rstan",
+    data = data_em_sp,
+    iter = 10000,
+    chains = 4,
+    init = init_fun_em_sp,
+    refresh = 1000
+  )
+RMSE_em_sp <- calculate_RMSE(fit_em_sp, sem_data)
+```
+
+
+## Improvement in RMSE: Plot for Figure 4
+
+```{r}
+rmse_data <- data.frame()
+beta_list <-
+  c(0, 0.1, 0.2, 0.25, 0.3, 0.35, 0.4, .45, 0.5, 0.55, .6)#seq(0,0.6,0.05)
+for (beta in beta_list) {
+  filename <- paste("data/fix/RMSE_", beta, ".Rda", sep = "")
+  rmse_beta <- readRDS(filename) |> tibble::add_column(beta = beta)
+  rmse_data <- rbind(rmse_data, rmse_beta)
+}
+```
+
+```{r}
+ggplot(data = rmse_data) + geom_line(aes(x = beta, y = RMSE_em_sp), color =
+                                       "orange") +
+  geom_line(aes(x = beta, y = RMSE_lm_simp), color = "#B22222") +
+  geom_line(aes(x = beta, y = RMSE_lm_comp), color = "steelblue") +
+  geom_line(aes(x = beta, y = RMSE_lm_oracle), color = "black") +
+  scale_x_continuous(expand = c(0, 0), limits = c(-0, 0.6)) +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.line = element_line(colour = "black"),
+    axis.text.x = element_text(size = 11),
+    axis.title.x = element_text(size = 14),
+    axis.text.y = element_text(size = 11)
+  ) +
+  ylab(latex2exp::TeX("RMSE")) +
+  annotate(
+    geom = "text",
+    x = 0.1,
+    y = 1.08,
+    label = latex2exp::TeX("Complex"),
+    color = "steelblue"
+  ) +
+  annotate(
+    geom = "text",
+    x = 0.5,
+    y = 0.95,
+    label = latex2exp::TeX("Simple"),
+    color = "#B22222"
+  ) +
+  annotate(
+    geom = "text",
+    x = 0.1,
+    y = 0.85,
+    label = latex2exp::TeX("Error Model"),
+    color = "orange"
+  ) +
+  annotate(
+    geom = "text",
+    x = 0.47,
+    y = 0.7,
+    label = latex2exp::TeX("Oracle"),
+    color = "black"
+  ) + xlab(latex2exp::TeX("\\beta"))
+```
+
+## Disparate Predictions: Creating plot for Figure 5
+
+```{r}
+ggplot(data = rmse_data) + geom_line(aes(x = beta, y = cor_em_sp), color =
+                                       "orange") +
+  geom_line(aes(x = beta, y = cor_em_sp_noZ),
+            color = "orange",
+            linetype = "dashed") +
+  geom_line(aes(x = beta, y = cor_lm_simp), color = "#B22222") +
+  geom_line(aes(x = beta, y = cor_lm_comp), color = "steelblue") +
+  geom_line(aes(x = beta, y = cor_lm_oracle), color = "black") +
+  scale_x_continuous(expand = c(0, 0), limits = c(-0, 0.6)) +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.line = element_line(colour = "black"),
+    axis.text.x = element_text(size = 11),
+    axis.title.x = element_text(size = 14),
+    axis.text.y = element_text(size = 11)
+  ) +
+  ylab(latex2exp::TeX("$corr(Z$,Prediction Error)")) +
+  annotate(
+    geom = "text",
+    x = 0.5,
+    y = -0.2,
+    label = latex2exp::TeX("Complex"),
+    color = "steelblue"
+  ) +
+  annotate(
+    geom = "text",
+    x = 0.5,
+    y = 0.35,
+    label = latex2exp::TeX("Simple"),
+    color = "#B22222"
+  ) +
+  annotate(
+    geom = "text",
+    x = 0.34,
+    y = 0.05,
+    label = latex2exp::TeX("Error Model with Z"),
+    color = "orange"
+  ) + xlab(latex2exp::TeX("\\beta")) + annotate(
+    geom = "text",
+    x = 0.1,
+    y = -0.2,
+    label = latex2exp::TeX("Error model without Z"),
+    color = "orange"
+  ) + xlab(latex2exp::TeX("\\beta"))
+```
+## Misspecification: Creating plots for Figure 6
+
+```{r}
+p_list <- c(0, 0.01, 0.1, 0.3, 0.5, 0.7, 1)
+sigma_list <- c(0.01, 0.1, 0.2)
+RMSE_data <- data.frame()
+for (grid_index in 1:21) {
+  params <- expand.grid(p = p_list, sigma_gamma = sigma_list)[grid_index, ]
+  p <- params$p
+  sigma_gamma <- params$sigma_gamma
+  file_name <-
+    paste("data/miss/miss_gamma/RMSE_",
+          p,
+          "_",
+          sigma_gamma,
+          ".Rda",
+          sep = "")
+  RMSE <-
+    readRDS(file = file_name) |> tibble::add_column(p = p, sigma_gamma = sigma_gamma)
+  RMSE_data <- rbind(RMSE_data, RMSE)
+}
+```
+
+```{r}
+ggplot() +
+  geom_line(data = RMSE_data,
+            aes(
+              x = 1 + p,
+              y = RMSE_em_sp,
+              group = sigma_gamma,
+              color = as.factor(sigma_gamma)
+            )) +
+  scale_colour_manual(values = c("orange", "#ff7518", "#e3ab57")) +
+  #geom_line(data=RMSE_data,aes(x=p,y=RMSE_lm_simp,group=sigma_gamma,color=sigma_gamma)) +
+  geom_hline(yintercept = 0.966924, color = "#B22222") +
+  geom_hline(yintercept = 1.007856, color = "steelblue") +
+  scale_x_continuous(
+    expand = c(0, 0),
+    limits = c(1, 2.2),
+    breaks = c(1, 1.5, 2)
+  ) +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.line = element_line(colour = "black"),
+    axis.text.x = element_text(size = 11),
+    axis.title.x = element_text(size = 14),
+    axis.text.y = element_text(size = 11)
+  ) +
+  ylab(latex2exp::TeX("RMSE")) +
+  xlab(latex2exp::TeX("multiplicative misspecification of \\gamma")) + theme(legend.position = "none") +
+  annotate(
+    geom = "text",
+    x = 1 + 0.1,
+    y = 1.003,
+    label = latex2exp::TeX("Complex"),
+    color = "steelblue"
+  ) +
+  annotate(
+    geom = "text",
+    x = 1 + 0.1,
+    y = 0.96,
+    label = latex2exp::TeX("Simple"),
+    color = "#B22222"
+  ) +
+  annotate(
+    geom = "text",
+    x = 1 + 0.59,
+    y = 0.93,
+    label = latex2exp::TeX("$\\sigma_{\\gamma} = 0.01$"),
+    color = "orange"
+  ) +
+  annotate(
+    geom = "text",
+    x = 1 + 1.1,
+    y = 0.957,
+    label = latex2exp::TeX("$\\sigma_{\\gamma} = 0.1$"),
+    color = "#ff7518"
+  ) +
+  annotate(
+    geom = "text",
+    x = 1 + 1.1,
+    y = 0.943,
+    label = latex2exp::TeX("$\\sigma_{\\gamma} = 0.2$"),
+    color = "#e3ab57"
+  )
+
+```
+```{r}
+ggplot() +
+  geom_line(data = RMSE_data,
+            aes(
+              x = 1 + p,
+              y = cor_em_sp,
+              group = sigma_gamma,
+              color = as.factor(sigma_gamma)
+            )) +
+  scale_colour_manual(values = c("orange", "#ff7518", "#e3ab57")) +
+  #geom_line(data=RMSE_data,aes(x=p,y=RMSE_lm_simp,group=sigma_gamma,color=sigma_gamma)) +
+  geom_hline(yintercept = 0.065085590, color = "#B22222") +
+  geom_hline(yintercept = -0.26287614, color = "steelblue") +
+  geom_hline(yintercept = 0, color = "black") +
+  
+  scale_x_continuous(
+    expand = c(0, 0),
+    limits = c(1, 2.02),
+    breaks = c(1, 1.5, 2)
+  ) +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.line = element_line(colour = "black"),
+    axis.text.x = element_text(size = 11),
+    axis.title.x = element_text(size = 14),
+    axis.text.y = element_text(size = 11)
+  ) +
+  ylab(latex2exp::TeX("$corr(Z$,Prediction Error)")) + xlab(latex2exp::TeX("multiplicative misspecification of $\\gamma$")) +
+  theme(legend.position = "none")
+```
+```{r}
+p_list <- c(-1.5, -2, 1.5, 2, 0, -0.5, 0.5, -1.0, 1.0)
+sigma_list <- c(0.01, 0.1, 0.2)
+RMSE_data <- data.frame()
+for (grid_index in 1:27) {
+  params <- expand.grid(p = p_list, sigma_gamma = sigma_list)[grid_index, ]
+  p <- params$p
+  sigma_gamma <- params$sigma_gamma
+  file_name <-
+    paste("data/miss/miss_beta/RMSE_",
+          p,
+          "_",
+          sigma_gamma,
+          ".Rda",
+          sep = "")
+  RMSE <-
+    readRDS(file = file_name) |> tibble::add_column(p = p, sigma_gamma = sigma_gamma)
+  RMSE_data <- rbind(RMSE_data, RMSE)
+}
+```
+
+```{r}
+ggplot() +
+  geom_line(data = RMSE_data,
+            aes(
+              x = (1 + p),
+              y = RMSE_em_sp,
+              group = sigma_gamma,
+              color = as.factor(sigma_gamma)
+            )) +
+  scale_colour_manual(values = c("orange", "#ff7518", "#e3ab57")) +
+  #geom_line(data=RMSE_data,aes(x=p,y=RMSE_lm_simp,group=sigma_gamma,color=sigma_gamma)) +
+  geom_hline(yintercept = 0.966924, color = "#B22222") +
+  geom_hline(yintercept = 1.007856, color = "steelblue") +
+  scale_x_continuous(expand = c(0, 0), limits = c(-1, 3.25)) +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.line = element_line(colour = "black"),
+    axis.text.x = element_text(size = 11),
+    axis.title.x = element_text(size = 14),
+    axis.text.y = element_text(size = 11)
+  ) +
+  ylab(latex2exp::TeX("RMSE")) +
+  xlab(latex2exp::TeX("multiplicative misspecification of $\\beta$")) + theme(legend.position = "none") +
+  annotate(
+    geom = "text",
+    x = 0.1,
+    y = 1.003,
+    label = latex2exp::TeX("Complex"),
+    color = "steelblue"
+  ) +
+  annotate(
+    geom = "text",
+    x = 0.1,
+    y = 0.96,
+    label = latex2exp::TeX("Simple"),
+    color = "#B22222"
+  ) +
+  annotate(
+    geom = "text",
+    x = 0,
+    y = 0.91,
+    label = latex2exp::TeX("$\\sigma_{\\gamma} = 0.01$"),
+    color = "orange"
+  ) +
+  annotate(
+    geom = "text",
+    x = 2.3,
+    y = 0.884,
+    label = latex2exp::TeX("$\\sigma_{\\gamma} = 0.1$"),
+    color = "#ff7518"
+  ) +
+  annotate(
+    geom = "text",
+    x = -0.1,
+    y = 0.875,
+    label = latex2exp::TeX("$\\sigma_{\\gamma} = 0.2$"),
+    color = "#e3ab57"
+  )
+```
+
+```{r}
+ggplot() +
+  geom_line(data = RMSE_data,
+            aes(
+              x = 1 + p,
+              y = cor_em_sp,
+              group = sigma_gamma,
+              color = as.factor(sigma_gamma)
+            )) +
+  scale_colour_manual(values = c("orange", "#ff7518", "#e3ab57")) +
+  #geom_line(data=RMSE_data,aes(x=p,y=RMSE_lm_simp,group=sigma_gamma,color=sigma_gamma)) +
+  geom_hline(yintercept = 0.065085590, color = "#B22222") +
+  geom_hline(yintercept = -0.26287614, color = "steelblue") +
+  geom_hline(yintercept = 0, color = "black") +
+  scale_x_continuous(
+    expand = c(0, 0),
+    limits = c(-1, 3.01),
+    breaks = c(-1, .0, 1, 2, 3)
+  ) +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.line = element_line(colour = "black"),
+    axis.text.x = element_text(size = 11),
+    axis.title.x = element_text(size = 14),
+    axis.text.y = element_text(size = 11)
+  ) +
+  ylab(latex2exp::TeX("$corr(Z$,Prediction Error)")) + xlab(latex2exp::TeX("multiplicative misspecification of $\\beta$")) + theme(legend.position = "none")
+```
+
